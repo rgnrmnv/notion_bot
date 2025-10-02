@@ -1,2 +1,0 @@
-python-telegram-bot[job-queue]==22.5
-notion-client==2.2.1
