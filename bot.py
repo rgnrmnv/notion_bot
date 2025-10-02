@@ -1,4 +1,5 @@
 import os
+import logging
 import threading
 import time
 import sqlite3
@@ -7,13 +8,22 @@ from datetime import datetime, timezone, timedelta
 
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+)
 from notion_client import Client
 
-# ——— Конфигурация ———
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+# ========== Логирование ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ========== Конфиг ==========
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
+NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 
 PROP_TITLE_CANDIDATES = ["Название", "Name"]
@@ -21,12 +31,12 @@ PROP_GROUP = "Группа"
 PROP_STATUS = "Статус"
 TRIGGER_STATUSES = {"Заканчивается", "ЗАКОНЧИЛОСЬ"}
 
-# ——— Инициализация ———
 notion = Client(auth=NOTION_TOKEN)
 app = Flask(__name__)
 
 DB_PATH = "state.db"
 
+# ========== База данных ==========
 def init_db():
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("""
@@ -46,6 +56,7 @@ def init_db():
                 value TEXT
             )
         """)
+    logger.info("БД инициализирована")
 
 def register_user(chat_id: int):
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
@@ -83,7 +94,7 @@ def get_meta(key: str):
         r = cur.fetchone()
     return r[0] if r else None
 
-# ——— Notion API вспомогательные ———
+# ========== Notion API ==========
 def get_db_meta():
     return notion.databases.retrieve(database_id=NOTION_DATABASE_ID)
 
@@ -113,8 +124,8 @@ def extract_title(page, title_prop):
         items = page["properties"][title_prop]["title"]
         if items:
             return items[0]["plain_text"]
-    except:
-        pass
+    except Exception as e:
+        logger.warning("extract_title error: %s", e)
     return "(без названия)"
 
 def extract_status(page):
@@ -122,8 +133,8 @@ def extract_status(page):
         prop = page["properties"][PROP_STATUS]
         if prop["type"] == "select" and prop["select"]:
             return prop["select"]["name"]
-    except:
-        pass
+    except Exception as e:
+        logger.warning("extract_status error: %s", e)
     return None
 
 def query_all():
@@ -178,10 +189,10 @@ def query_since(since_iso: str):
         start_cursor = resp.get("next_cursor")
     return pages
 
-# ——— Telegram части ———
+# ========== Telegram handlers ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    init_db()
     register_user(update.effective_chat.id)
+    logger.info("Пользователь %s нажал /start", update.effective_chat.id)
 
     db_meta = get_db_meta()
     title_prop = get_title_prop_name(db_meta)
@@ -204,6 +215,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    logger.info("Пользователь %s запрашивает Все", chat_id)
+
     db_meta = get_db_meta()
     title_prop = get_title_prop_name(db_meta)
     pages = query_all()
@@ -227,6 +240,8 @@ async def callback_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     group_name = update.callback_query.data.split(":", 1)[1]
+    logger.info("Пользователь %s выбрал группу %s", chat_id, group_name)
+
     db_meta = get_db_meta()
     title_prop = get_title_prop_name(db_meta)
     pages = query_by_group(group_name)
@@ -271,29 +286,31 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
                 title = extract_title(p, title_prop)
                 url = p.get("url", "")
                 text = f"⚠️ <b>{title}</b>\nСтатус: {curr}\n{url}"
-                for cid in get_subscribers():
+                subs = get_subscribers()
+                logger.info("Уведомление: запись %s перешла в %s, подписчики: %s", title, curr, subs)
+                for cid in subs:
                     try:
                         await context.bot.send_message(cid, text, parse_mode="HTML")
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.error("Ошибка отправки уведомления %s → %s : %s", cid, title, e)
 
         set_meta("last_checked_iso", now_iso)
+
     except Exception as e:
-        print("Ошибка в periodic_check:", e)
+        logger.error("Ошибка в periodic_check: %s", e, exc_info=True)
 
 def start_polling_bot():
-    """Запуск бота через Application (async) — внутри потока."""
+    logger.info("Запускаю Telegram бот…")
     app_bot = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app_bot.add_handler(CommandHandler("start", start_command))
     app_bot.add_handler(CallbackQueryHandler(callback_all, pattern="^all$"))
     app_bot.add_handler(CallbackQueryHandler(callback_group, pattern="^group:"))
 
-    # JobQueue — встроенный планировщик
     app_bot.job_queue.run_repeating(periodic_check, interval=POLL_INTERVAL_SECONDS, first=5)
+    logger.info("JobQueue настроен, интервал %s секунд", POLL_INTERVAL_SECONDS)
 
     app_bot.run_polling()
 
-# ——— Flask маршрут, чтобы Render считал приложение живым ———
 @app.route("/")
 def health_check():
     return "OK", 200
@@ -304,10 +321,10 @@ def bot_thread_func():
 if __name__ == "__main__":
     init_db()
 
-    # Запускаем Telegram-бота в отдельном потоке
+    logger.info("Запуск бот-сервера в фоне…")
     t = threading.Thread(target=bot_thread_func, daemon=True)
     t.start()
 
-    # Запускаем веб-сервис (Flask) для поддержания HTTP
     port = int(os.environ.get("PORT", 8000))
+    logger.info("Flask запущен, слушаю порт %s", port)
     app.run(host="0.0.0.0", port=port)
