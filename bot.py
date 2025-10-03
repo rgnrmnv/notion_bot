@@ -9,6 +9,7 @@ from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from notion_client import Client
+from notion_client import APIResponseError
 
 # ===== Логирование =====
 logging.basicConfig(
@@ -26,9 +27,10 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 PROP_TITLE_CANDIDATES = ["Название", "Name"]
 PROP_GROUP = "Группа"
 PROP_STATUS = "Статус"
-TRIGGER_STATUSES = {"Заканчивается", "ЗАКОНЧИЛОСЬ"}
+TRIGGER_STATUSES = {"Заканчивается", "ZAKONCHILОСЬ", "ЗАКОНЧИЛОСЬ"}  # Учти точное написание
 
-notion = Client(auth=NOTION_TOKEN)
+# ===== Notion клиент с указанием версии API =====
+notion = Client(auth=NOTION_TOKEN, notion_version="2025-09-03")
 
 # ===== SQLite хранилище =====
 DB_PATH = "state.db"
@@ -134,11 +136,14 @@ def extract_status(page):
     return None
 
 async def query_all():
+    kwargs = {}
+    # Если база требует указания data_source_id — можно тут подставить, если знаешь
     pages = []
     start_cursor = None
     while True:
         resp = notion.databases.query(
             database_id=NOTION_DATABASE_ID,
+            **kwargs,
             start_cursor=start_cursor,
             page_size=100
         )
@@ -149,13 +154,13 @@ async def query_all():
     return pages
 
 async def query_by_group(group_name: str):
+    kwargs = {"filter": {"property": PROP_GROUP, "select": {"equals": group_name}}}
     pages = []
     start_cursor = None
-    flt = {"property": PROP_GROUP, "select": {"equals": group_name}}
     while True:
         resp = notion.databases.query(
             database_id=NOTION_DATABASE_ID,
-            filter=flt,
+            **kwargs,
             start_cursor=start_cursor,
             page_size=100
         )
@@ -166,16 +171,16 @@ async def query_by_group(group_name: str):
     return pages
 
 async def query_since(since_iso: str):
-    pages = []
-    start_cursor = None
-    flt_time = {
+    kwargs = {"filter": {
         "timestamp": "last_edited_time",
         "last_edited_time": {"on_or_after": since_iso}
-    }
+    }}
+    pages = []
+    start_cursor = None
     while True:
         resp = notion.databases.query(
             database_id=NOTION_DATABASE_ID,
-            filter=flt_time,
+            **kwargs,
             start_cursor=start_cursor,
             page_size=100
         )
@@ -258,7 +263,7 @@ async def cb_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id, text, parse_mode="HTML")
     await update.callback_query.answer()
 
-# ===== Фоновая функция проверки =====
+# ===== Фоновая задача проверки =====
 async def check_loop(app_bot: Application):
     last_checked = get_meta("last_checked_iso")
     if not last_checked:
@@ -292,6 +297,8 @@ async def check_loop(app_bot: Application):
                             logger.error("Ошибка отправки уведомления %s: %s", cid, e)
 
             set_meta("last_checked_iso", now_iso)
+        except APIResponseError as er:
+            logger.error("Notion API ошибка: %s", er)
         except Exception as e:
             logger.error("Ошибка в check_loop: %s", e)
         await asyncio.sleep(POLL_INTERVAL)
@@ -308,16 +315,13 @@ async def run_app():
     app_bot.add_handler(CallbackQueryHandler(cb_all, pattern="^all$"))
     app_bot.add_handler(CallbackQueryHandler(cb_group, pattern="^group:"))
 
-    # Запускаем бота
     await app_bot.initialize()
     await app_bot.start()
     logger.info("Telegram бот запущен")
 
-    # Запускаем фоновую проверку
     asyncio.create_task(check_loop(app_bot))
     logger.info("Запущен check_loop task")
 
-    # Запускаем HTTP сервер
     aio = web.Application()
     aio.add_routes([web.get("/", health)])
     runner = web.AppRunner(aio)
@@ -327,8 +331,8 @@ async def run_app():
     await site.start()
     logger.info("HTTP сервер запущен на порту %s", port)
 
-    # Держим приложение живым до завершения бота
-    await app_bot.updater.wait_stopped()
+    # Ждём вечно, чтобы приложение не завершилось
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(run_app())
