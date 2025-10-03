@@ -1,24 +1,23 @@
 import os
 import logging
 import asyncio
-from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes
-)
-from notion_client import Client
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone, timedelta
 
-# ========== Логирование ==========
+from aiohttp import web
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from notion_client import Client
+
+# ===== Логирование =====
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# ========== Конфигурация ==========
+# ===== Конфигурация =====
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -27,12 +26,11 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 PROP_TITLE_CANDIDATES = ["Название", "Name"]
 PROP_GROUP = "Группа"
 PROP_STATUS = "Статус"
-TRIGGER_STATUSES = {"Заканчивается", "ZAKONCHILOSЬ", "ЗАКОНЧИЛОСЬ"}  # проверь точные варианты
+TRIGGER_STATUSES = {"Заканчивается", "ЗАКОНЧИЛОСЬ"}
 
-# ========== Инициализация Notion ==========
 notion = Client(auth=NOTION_TOKEN)
 
-# ========== SQLite вспомогательные функции ==========
+# ===== SQLite хранилище =====
 DB_PATH = "state.db"
 
 def init_db():
@@ -54,7 +52,7 @@ def init_db():
                 value TEXT
             )
         """)
-    logger.info("БД инициализирована")
+    logger.info("База данных инициализирована")
 
 def register_user(chat_id: int):
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
@@ -68,16 +66,15 @@ def get_subscribers():
 def get_last_status(page_id: str):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute("SELECT last_status FROM page_status WHERE page_id=?", (page_id,))
-        r = cur.fetchone()
-    return r[0] if r else None
+        row = cur.fetchone()
+    return row[0] if row else None
 
 def upsert_status(page_id: str, status: str):
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute("""
             INSERT INTO page_status(page_id, last_status)
             VALUES (?, ?)
-            ON CONFLICT(page_id)
-            DO UPDATE SET last_status=excluded.last_status
+            ON CONFLICT(page_id) DO UPDATE SET last_status=excluded.last_status
         """, (page_id, status))
 
 def set_meta(key: str, value: str):
@@ -93,7 +90,7 @@ def get_meta(key: str):
         row = cur.fetchone()
     return row[0] if row else None
 
-# ========== Notion вспомогательные функции ==========
+# ===== Notion вспомогательные =====
 def get_db_meta():
     return notion.databases.retrieve(database_id=NOTION_DATABASE_ID)
 
@@ -124,7 +121,7 @@ def extract_title(page, title_prop):
         if items:
             return items[0]["plain_text"]
     except Exception as e:
-        logger.warning("extract_title error: %s", e)
+        logger.warning("Ошибка extract_title: %s", e)
     return "(без названия)"
 
 def extract_status(page):
@@ -133,7 +130,7 @@ def extract_status(page):
         if prop["type"] == "select" and prop["select"]:
             return prop["select"]["name"]
     except Exception as e:
-        logger.warning("extract_status error: %s", e)
+        logger.warning("Ошибка extract_status: %s", e)
     return None
 
 async def query_all():
@@ -188,10 +185,10 @@ async def query_since(since_iso: str):
         start_cursor = resp.get("next_cursor")
     return pages
 
-# ========== Telegram handlers ==========
+# ===== Telegram хендлеры =====
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_chat.id)
-    logger.info("Пользователь %s начал /start", update.effective_chat.id)
+    logger.info("Пользователь %s нажал /start", update.effective_chat.id)
 
     db_meta = get_db_meta()
     title_prop = get_title_prop_name(db_meta)
@@ -261,8 +258,8 @@ async def cb_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id, text, parse_mode="HTML")
     await update.callback_query.answer()
 
-# Фоновая задача проверки Notion
-async def check_loop(app: Application):
+# ===== Фоновая функция проверки =====
+async def check_loop(app_bot: Application):
     last_checked = get_meta("last_checked_iso")
     if not last_checked:
         dt0 = datetime.now(timezone.utc) - timedelta(days=1)
@@ -287,10 +284,10 @@ async def check_loop(app: Application):
                     url = p.get("url", "")
                     text = f"⚠️ <b>{title}</b>\nСтатус: {curr}\n{url}"
                     subs = get_subscribers()
-                    logger.info("Notify: %s → %s, подписчики: %s", title, curr, subs)
+                    logger.info("Уведомление: %s → %s, подписчики: %s", title, curr, subs)
                     for cid in subs:
                         try:
-                            await app.bot.send_message(cid, text, parse_mode="HTML")
+                            await app_bot.bot.send_message(cid, text, parse_mode="HTML")
                         except Exception as e:
                             logger.error("Ошибка отправки уведомления %s: %s", cid, e)
 
@@ -299,42 +296,39 @@ async def check_loop(app: Application):
             logger.error("Ошибка в check_loop: %s", e)
         await asyncio.sleep(POLL_INTERVAL)
 
-# ========== aiohttp HTTP & запуск ==========
+# ===== HTTP через aiohttp =====
 async def health(request):
     return web.Response(text="OK")
 
 async def run_app():
-    # инициализировать базу
     init_db()
 
-    # создать Telegram приложение
     app_bot = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app_bot.add_handler(CommandHandler("start", start_handler))
     app_bot.add_handler(CallbackQueryHandler(cb_all, pattern="^all$"))
     app_bot.add_handler(CallbackQueryHandler(cb_group, pattern="^group:"))
 
-    # добавить фоновую задачу
-    app_bot.job_queue.run_repeating(lambda ctx: check_loop(app_bot), interval=POLL_INTERVAL, first=5)
-    logger.info("JobQueue set up, interval %s", POLL_INTERVAL)
-
-    # старт polling
+    # Запускаем бота
     await app_bot.initialize()
     await app_bot.start()
-    logger.info("Telegram polling started")
+    logger.info("Telegram бот запущен")
 
-    # запустить aiohttp сервер
-    aio_app = web.Application()
-    aio_app.add_routes([web.get("/", health)])
-    runner = web.AppRunner(aio_app)
+    # Запускаем фоновую проверку
+    asyncio.create_task(check_loop(app_bot))
+    logger.info("Запущен check_loop task")
+
+    # Запускаем HTTP сервер
+    aio = web.Application()
+    aio.add_routes([web.get("/", health)])
+    runner = web.AppRunner(aio)
     await runner.setup()
     port = int(os.environ.get("PORT", 8000))
     site = web.TCPSite(runner, host="0.0.0.0", port=port)
     await site.start()
-    logger.info("HTTP server started on port %s", port)
+    logger.info("HTTP сервер запущен на порту %s", port)
 
-    # держим весь сервис живым
+    # Держим приложение живым до завершения бота
     await app_bot.updater.wait_stopped()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(run_app())
